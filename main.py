@@ -1,17 +1,13 @@
 import datetime
-from typing import Type, Any, List, TypeVar
-import resources
-a  = resources.SELECT_ACTION_TYPES
 import telebot
 from telebot import types
-import time
 import sqlite3
+import os
+import tempfile
 TOKEN = "6241338600:AAGl-8YywU5QI7W8Ky-MleqaSrRldqYQrcI"
 PASSWORD = '1111'
-
 bot = telebot.TeleBot(TOKEN)
 
-# Create a database connector
 class DbConnector:
     def __init__(self, db_name):
         self.db_name = db_name
@@ -59,8 +55,8 @@ class DbConnector:
         conn.close()
 
 db = DbConnector("scanner_bot.db")
+forbidden_message_action = "Delete"
 
-# Helper functions
 def check_password(message):
     return message.text == PASSWORD
 
@@ -140,11 +136,25 @@ def disable_monitoring(message):
         bot.reply_to(message, "Enter the chat ID to disable monitoring:")
         bot.register_next_step_handler(message, handle_disable_monitoring)
 
+def remove_special_chars_and_spaces(input_string):
+    cleaned_string = ''.join([char for char in input_string if char.isalnum()])
+    return cleaned_string
+
+# def generate_substrings(input_string):
+#     cleaned_string = remove_special_chars_and_spaces(input_string)
+#     substrings = [cleaned_string[i: j] for i in range(len(cleaned_string)) for j in range(i + 1, len(cleaned_string) + 1)]
+#     return substrings
+
+
 def check_forbidden_words(message_text):
     black_list = db.read("SELECT message FROM messages_black_list")
+    message_text = remove_special_chars_and_spaces(message_text)
+    # message_words = generate_substrings(message_text.lower())
     forbidden_words = [word[0] for word in black_list if word[0] in message_text.lower()]
     forbidden_words = list(set(forbidden_words))
     return forbidden_words
+
+
 def add_to_messages_history(chat_name, user_name, message_text, sent_datetime, matched_forbidden_words):
     db.write('''INSERT INTO messages_history
                 (chat_name, user_name, message_text, sent_datetime, matched_forbidden_words)
@@ -159,10 +169,11 @@ def handle_start(message):
 
 
 def get_user_menu_markup():
+    global forbidden_message_action
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
     markup.add(types.KeyboardButton("Show blacklist"), types.KeyboardButton("Add to blacklist"), types.KeyboardButton("Delete blacklist word"))
     markup.add(types.KeyboardButton("Show chats"), types.KeyboardButton("Enable monitoring"),types.KeyboardButton("Disable monitoring"))
-    markup.add(types.KeyboardButton("Show messages history"), types.KeyboardButton("Delete all messages history"))
+    markup.add(types.KeyboardButton("Show messages history"), types.KeyboardButton("Delete all messages history"), types.KeyboardButton(f"Action:{forbidden_message_action}"))
 
     return markup
 
@@ -201,14 +212,36 @@ def handle_disable_monitoring(message):
         bot.send_message(message.chat.id, "No chats with enabled monitoring were found.")
 
 def handle_show_messages_history(message):
-    messages_history = db.read("SELECT chat_name, user_name, message_text, sent_datetime, matched_forbidden_words FROM messages_history")
+    messages_history = db.read("SELECT * FROM messages_history")
     if messages_history:
-        formatted_history = '\n\n'.join([f"Chat Name: {msg[0]}\nUser: {msg[1]}\nMessage: {msg[2]}\nSent: {msg[3]}\nForbidden Words: {msg[4]}" for msg in messages_history])
-        bot.send_message(message.chat.id, f"Messages History:\n{formatted_history}")
+
+
+            chat_history_text = ""
+            for count, history in enumerate(messages_history, start=1):
+                chat_history_text += (f"{count}) Chat Name: {history[1]}\n"
+                                      f"   User: @{history[2]}\n"
+                                      f"   Message: {history[3]}\n"
+                                      f"   Sent: {history[4]}\n"
+                                      f"   Forbidden Words: {history[5]}\n\n")
+            try:
+                bot.send_message(message.chat.id, chat_history_text)
+            except:
+                bot.send_message(message.chat.id, "History is too long!")
+
+            # Save the history text to a file.
+            with tempfile.NamedTemporaryFile(mode="w+", delete=False) as temp_file:
+                temp_file.write(chat_history_text)
+                temp_file.flush()
+                temp_file.close()
+
+                with open(temp_file.name, "rb") as file:
+                    bot.send_document(message.chat.id, file, caption="here's your history")
+
+            os.unlink(temp_file.name)
     else:
         bot.send_message(message.chat.id, "No messages history found.")
 
-@bot.message_handler(func=lambda m: m.text in ["Add to blacklist", "Delete blacklist word", "Show blacklist", "Show chats", "Show messages history", "Delete all messages history", "Enable monitoring", "Disable monitoring"] and is_private_chat(m.chat))
+@bot.message_handler(func=lambda m: m.text in ["Add to blacklist", "Delete blacklist word", "Show blacklist", "Show chats", "Show messages history", "Delete all messages history", "Enable monitoring", "Disable monitoring", "Action:Delete", "Action:Warning"] and is_private_chat(m.chat))
 def handle_menu_options(message):
     chat_id = message.chat.id
     if message.text == "Add to blacklist":
@@ -239,6 +272,10 @@ def handle_menu_options(message):
             bot.send_message(chat_id, "Select a chat to disable monitoring:", reply_markup=markup)
         else:
             bot.send_message(chat_id, "No chats with enabled monitoring were found.")
+    elif message.text in ("Action:Delete", "Action:Warning"):
+        global forbidden_message_action
+        forbidden_message_action = "Delete" if message.text.split(':')[1] == "Warning" else "Warning"
+        bot.reply_to(message, f"Changed forbidden word usage action to {forbidden_message_action}", reply_markup=get_user_menu_markup())
 
 @bot.message_handler(func=lambda m: True)
 def handle_messages(message):
@@ -266,9 +303,12 @@ def handle_messages(message):
                 sent_datetime = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 matched_forbidden_words = ', '.join(forbidden_words)
                 add_to_messages_history(chat_name, user_name, message_text, sent_datetime, matched_forbidden_words)
-                bot.delete_message(chat_id, message.message_id)
-                bot.send_message(chat_id,f"@{user_name} sent a message containing forbidden words: {matched_forbidden_words}")
-                # bot.reply_to(message, f"You've sent forbidden words: {matched_forbidden_words}")
+                global forbidden_message_action
+                if forbidden_message_action == "Delete":
+                    bot.delete_message(chat_id, message.message_id)
+                    bot.send_message(chat_id,f"@{user_name} sent a message containing forbidden words: {matched_forbidden_words}")
+                else:
+                    bot.reply_to(message, f"You've sent forbidden words: {matched_forbidden_words}")
 
 # Start the bot
 
